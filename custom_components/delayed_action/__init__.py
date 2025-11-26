@@ -5,11 +5,13 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant, callback, Context
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.storage import Store
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.event import async_call_later, async_track_point_in_time
 from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
 from homeassistant.helpers.service import async_register_admin_service
 from .const import DOMAIN, ATTR_ENTITY_ID, ATTR_DELAY, ATTR_ACTION, ATTR_DATETIME, ATTR_ADDITIONAL_DATA, ATTR_TASK_ID, CONF_DOMAINS, ATTR_DOMAINS
+from typing import Any, Optional
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +48,18 @@ CONFIG_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
+STORAGE_VERSION = 1
+STORAGE_KEY = DOMAIN
+
+class CallContext:
+    def __init__(self, *, call=None):
+        if call:
+            self.id = call.context.id
+            self.user_id = call.context.user_id
+        else:
+            self.id = None
+            self.user_id = None
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Delayed Action component."""
     _LOGGER.info("Setting up Delayed Action component")
@@ -66,6 +80,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     _LOGGER.info("Delayed Action component setup complete")
 
+    store = Store[dict[str, Any]](hass, STORAGE_VERSION, STORAGE_KEY)
+
     async def handle_delayed_action(call):
         entity_id = call.data[ATTR_ENTITY_ID]
         action = call.data[ATTR_ACTION]
@@ -73,7 +89,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         scheduled_time = call.data.get(ATTR_DATETIME)
         additional_data = call.data.get(ATTR_ADDITIONAL_DATA, {})
 
+        call_context = CallContext(call=call)
+
         task_id = str(uuid.uuid4())
+
+        await handle_delayed_action_expanded(
+            task_id,
+            entity_id,
+            action,
+            additional_data,
+            call_context,
+            delay=delay,
+            scheduled_time=scheduled_time,
+        )
+
+    async def handle_delayed_action_expanded(
+        task_id: str,
+        entity_id: str,
+        action: str, # maybe this type, maybe not
+        additional_data: dict,
+        call_context: CallContext,
+        *,
+        delay: Optional[int],
+        scheduled_time: Optional[datetime],
+        save_state=True,
+    ):
         if delay:
             delay_seconds = delay
             action_data = {
@@ -87,8 +127,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 action_data[ATTR_ADDITIONAL_DATA] = additional_data
 
             _LOGGER.info(f"Scheduling {action} for {entity_id} in {delay_seconds} seconds with task ID {task_id}")
-            task = async_call_later(hass, delay_seconds, lambda _: hass.loop.call_soon_threadsafe(_handle_action, hass, action_data, call))
-            _store_task(hass, entity_id, action, task_id, task, datetime.now() + timedelta(seconds=delay_seconds))
+            task = async_call_later(hass, delay_seconds, lambda _: hass.loop.call_soon_threadsafe(_handle_action, hass, action_data, call_context))
+            await _store_task(hass, entity_id, action, task_id, task, datetime.now() + timedelta(seconds=delay_seconds), save_state)
         elif scheduled_time:
             now = datetime.now()
             delay_seconds = (scheduled_time - now).total_seconds()
@@ -106,13 +146,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if additional_data is not None:
                 action_data[ATTR_ADDITIONAL_DATA] = additional_data
             _LOGGER.info(f"Scheduling {action} for {entity_id} at {scheduled_time} with task ID {task_id}")
-            task = async_track_point_in_time(hass, lambda _: hass.loop.call_soon_threadsafe(_handle_action, hass, action_data, call), scheduled_time)
-            _store_task(hass, entity_id, action, task_id, task, scheduled_time)
+            task = async_track_point_in_time(hass, lambda _: hass.loop.call_soon_threadsafe(_handle_action, hass, action_data, call_context), scheduled_time)
+            await _store_task(hass, entity_id, action, task_id, task, scheduled_time, save_state)
         else:
             _LOGGER.error("Either delay or datetime must be provided.")
 
     @callback
-    def _handle_action(hass, action_data, call):
+    def _handle_action(hass, action_data, call_context):
         entity_id = action_data[ATTR_ENTITY_ID]
         action = action_data[ATTR_ACTION]
         task_id = action_data[ATTR_TASK_ID]
@@ -129,20 +169,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if additional_data is not None:
             service_data.update(additional_data)
 
-        context = Context(parent_id=call.context.id, user_id=call.context.user_id)
+        context = Context(parent_id=call_context.id, user_id=call_context.user_id) if call_context else None
 
         hass.loop.call_soon_threadsafe(
             hass.async_create_task,
             hass.services.async_call(domain, action, service_data, context=context)
         )
-        _LOGGER.info(f"Executed {action} for {entity_id} with context {context}")
-        _remove_task(hass, entity_id, task_id)
+        _LOGGER.info(f"Executed {action} for {entity_id} with context {context if context else '<none>'}")
+        hass.async_create_task(_remove_task(hass, entity_id, task_id))
 
     async def handle_cancel_action(call):
         entity_id = call.data.get(ATTR_ENTITY_ID)
         task_id = call.data.get(ATTR_TASK_ID)
 
-        if _cancel_task(hass, entity_id, task_id):
+        if await _cancel_task(hass, entity_id, task_id):
             _LOGGER.info(f"Cancelled scheduled action for entity_id={entity_id}, task_id={task_id}")
         else:
             _LOGGER.error(f"No scheduled action found for entity_id={entity_id}, task_id={task_id}")
@@ -158,7 +198,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Handle the service call to get config."""
         hass.bus.fire(f"{DOMAIN}_get_config_response", serialize_config(config))
 
-    def _store_task(hass, entity_id, action, task_id, task, due):
+    async def _store_task(hass, entity_id, action, task_id, task, due, save_state):
         if entity_id not in hass.data[DOMAIN]["tasks"]:
             hass.data[DOMAIN]["tasks"][entity_id] = {}
         hass.data[DOMAIN]["tasks"][entity_id][task_id] = {
@@ -168,34 +208,44 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "due": due,
         }
 
-    def _remove_task(hass, entity_id, task_id):
+        if save_state:
+            await _save_state(hass)
+
+    async def _remove_task(hass, entity_id, task_id):
+        changed = False
+
         if entity_id in hass.data[DOMAIN]["tasks"]:
             if task_id in hass.data[DOMAIN]["tasks"][entity_id]:
                 del hass.data[DOMAIN]["tasks"][entity_id][task_id]
+                changed = True
                 if not hass.data[DOMAIN]["tasks"][entity_id]:
                     del hass.data[DOMAIN]["tasks"][entity_id]
+                    changed = True
 
-    def _cancel_task(hass, entity_id=None, task_id=None):
+        if changed:
+            await _save_state(hass)
+
+    async def _cancel_task(hass, entity_id=None, task_id=None):
         if entity_id:
             if entity_id in hass.data[DOMAIN]["tasks"]:
                 if task_id:
                     if task_id in hass.data[DOMAIN]["tasks"][entity_id]:
                         task = hass.data[DOMAIN]["tasks"][entity_id][task_id]["task"]
                         task()
-                        _remove_task(hass, entity_id, task_id)
+                        await _remove_task(hass, entity_id, task_id)
                         return True
                 else:
                     for task_id, task_data in list(hass.data[DOMAIN]["tasks"][entity_id].items()):
                         task = task_data["task"]
                         task()
-                        _remove_task(hass, entity_id, task_id)
+                        await _remove_task(hass, entity_id, task_id)
                     return True
         else:
             for entity_id in list(hass.data[DOMAIN]["tasks"].keys()):
                 for task_id, task_data in list(hass.data[DOMAIN]["tasks"][entity_id].items()):
                     task = task_data["task"]
                     task()
-                    _remove_task(hass, entity_id, task_id)
+                    await _remove_task(hass, entity_id, task_id)
             return True
         return False
 
@@ -213,6 +263,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "action": task_data["action"],
                     "task_id": task_id,
                     "due": task_data["due"].isoformat(),
+                    "additional_data": task_data.get(ATTR_ADDITIONAL_DATA)
                 }
         return serialized
 
@@ -222,11 +273,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         serialized[CONF_DOMAINS] = config.get(CONF_DOMAINS, ATTR_DOMAINS)
         return serialized
 
+    async def _load_state():
+        state = await store.async_load()
+        if state is None:
+            _LOGGER.info("No saved state")
+            return
+
+        call_context = CallContext()
+
+        task_count = 0
+        for entity_id, tasks in state.items():
+            for task_id, task_data in tasks.items():
+                action = task_data["action"]
+                due = datetime.fromisoformat(task_data["due"])
+                additional_data = task_data["additional_data"]
+
+                await handle_delayed_action_expanded(
+                    task_id,
+                    entity_id,
+                    action,
+                    additional_data,
+                    call_context,
+                    delay=None,
+                    scheduled_time=due,
+                    save_state=False,
+                )
+                task_count += 1
+
+        _LOGGER.debug(f"Loaded state: for {len(state)} entities, a total of {task_count} delayed tasks")
+
+    async def _save_state(hass):
+        serialized_actions = _serialize_actions(_list_tasks(hass))
+        await store.async_save(serialized_actions)
+        _LOGGER.debug("Saved state")
+
     hass.services.async_register(DOMAIN, SERVICE_DELAYED_ACTION, handle_delayed_action, schema=SERVICE_DELAY_SCHEMA)
     hass.services.async_register(DOMAIN, SERVICE_CANCEL_ACTION, handle_cancel_action, schema=SERVICE_CANCEL_SCHEMA)
     async_register_admin_service(hass, DOMAIN, SERVICE_GET_DOMAIN, get_config_service, schema=vol.Schema({}))
     async_register_admin_service(hass, DOMAIN, SERVICE_LIST_ACTIONS, handle_list_actions, schema=vol.Schema({vol.Optional(ATTR_ENTITY_ID): cv.entity_id}))
     _LOGGER.info(f"Registered services {SERVICE_DELAYED_ACTION}, {SERVICE_CANCEL_ACTION}, and {SERVICE_LIST_ACTIONS}")
+
+    await _load_state()
 
     _LOGGER.info("Delayed Action component setup complete")
     return True
